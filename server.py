@@ -45,6 +45,44 @@ def main():
 
         print(f'[server] RX from {src}: bytes={len(data)} "{preview}"')
 
+        #parse packet by type
+        if ptype == "B": #beacon
+            # expect: B|session|msg_id|ts|payload
+            if len(parts) >= 5:
+                session = parts[1]
+                msg_id = parts[2]
+                print(f'[server] BEACON session={session} msg_id={msg_id}')
+            else:
+                print(f'[server] Malformed BEACON')
+        elif ptype == "D": #data
+            # expect: D|session|msg-id|seq|total|crc|payload
+            if len(parts) >= 7:
+                session = parts[1]
+                msg_id = parts[2]
+                seq = parts[3]
+                total = parts[4]
+                print(f'[server] DATA session={session} msg_id={msg_id} seq={seq}/{total}')
+                #Build ACK
+                ack_text = f"A|{session}|{msg_id}|{seq}"
+                ack_bytes = ack_text.encode("utf-8")
+                sock.sendto(ack_bytes, addr)
+
+                print(f'[server] TX ACK {ack_text}')
+                log_event(args.log, {
+                    "ts_ms": now_ms(),
+                    "direction": "server_tx",
+                    "dst": src,
+                    "wire_bytes": len(ack_bytes),
+                    "preview": ack_text,
+                    "data": ack_bytes.hex()
+                })
+            else:
+                print(f'[server] Malformed DATA')       
+        elif ptype == "A": #ACK
+            print(f'[server] RX ACK (unexpected for server)')
+        else:
+            print(f'[server] Unknown packet type: {ptype}')
+
         event = {
             "ts_ms": now_ms(),
             "direction": "server_rx",
