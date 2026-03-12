@@ -1,19 +1,43 @@
 import os
-import  argparse
+import argparse
 import socket
 import json
 import time
 import base64
+from typing import Optional
+from dataclasses import dataclass, asdict
 import zlib
+import dnsish
+
+PREFIX = [b"csc321", b"mastery", b"demo"]
+PREFIX_LEN = len(PREFIX)
+
+@dataclass
+class LogEvent:
+    ts_ms: int
+    direction: str          # "server_rx" or "server_tx"
+    wire_bytes: int
+    data_hex: str
+    # Optional fields (only set when relevant)
+    src: Optional[str] = None
+    dst: Optional[str] = None
+    ver: Optional[int] = None
+    flags: Optional[int] = None
+    msg_id: Optional[int] = None
+    seq: Optional[int] = None
+    total: Optional[int] = None
+    crc_ok: Optional[bool] = None
+    payload_ok: Optional[bool] = None
+    parse_ok: Optional[bool] = None
 
 def now_ms() -> int:
     return int(time.time() * 1000)
 
-def log_event(path: str, event: dict) -> None:
+def log_event(path: str, ev: LogEvent) -> None:
     log_dir = os.path.dirname(path)
     if log_dir:
         os.makedirs(log_dir, exist_ok=True)
-    line = json.dumps(event, separators=(',', ':'), ensure_ascii=False)
+    line = json.dumps(asdict(ev), separators=(',', ':'), ensure_ascii=False)
     with open(path, 'a', encoding='utf-8') as f:
         f.write(line + '\n')
         f.flush()
@@ -39,98 +63,119 @@ def main():
         data, addr = sock.recvfrom(65535)
         #source ip and port
         src = f"{addr[0]}:{addr[1]}"
-        #parse into parts by '|', first part is type, rest is payload
-        text = data.decode("utf-8", errors="replace")
-        parts = text.split('|')
-        ptype = parts[0] if parts else None
-        #preview of text for logging
-        preview = text[:50]
-
+        preview = data[:80]
+        
         print(f'[server] RX from {src}: bytes={len(data)} "{preview}"')
 
-        #parse packet by type
-        if ptype == "B": #beacon
-            # expect: B|session|msg_id|ts|payload
-            if len(parts) >= 5:
-                session = parts[1]
-                msg_id = parts[2]
-                print(f'[server] BEACON session={session} msg_id={msg_id}')
-            else:
-                print(f'[server] Malformed BEACON')
-        elif ptype == "D": #data
-            # expect: D|session|msg-id|seq|total|crc|payload
-            if len(parts) >= 7:
-                session = parts[1]
-                msg_id = parts[2]
-                seq = parts[3]
-                total = parts[4]
-                crc_hex = parts[5]
-                payload_b32 = parts[6]
-                print(f'[server] DATA session={session} msg_id={msg_id} seq={seq}/{total}')
-                #decode payload
-                try:
-                    payload_raw = base64.b32decode(payload_b32, casefold=True)
-                except Exception as e:
-                    print(f"[server] base32 decode failed: {e}")
-                    payload_raw = None
-                #check crc
-                crc_calc = zlib.crc32(payload_raw) & 0xffffffff if payload_raw is not None else None
-                crc_calc_hex = f"{crc_calc:08x}" if crc_calc is not None else None
-                crc_ok = (crc_calc_hex == crc_hex)
-                if not crc_ok:
-                    print(f"[server] CRC mismatch: expected {crc_hex} calculated {crc_calc_hex}")
-                    #TODO: log rx with crc_ok = false
-                    continue
-                #store chunk
-                key = (session, msg_id)
-                st = messages.get(key)
-                if st is None:
-                    st = {"total": int(total), "chunks": {}}
-                    messages[key] = st
-                    #total should match, if not prefer first seen
-                if seq not in st["chunks"]:
-                    st["chunks"][seq] = payload_raw
-                else:
-                    #duplicate chunk, ignore
-                    pass
-                #Build ACK
-                ack_text = f"A|{session}|{msg_id}|{seq}"
-                ack_bytes = ack_text.encode("utf-8")
-                sock.sendto(ack_bytes, addr)
-                # reassemble message if complete
-                if len(st["chunks"]) == st["total"]:
-                    data_out = b''.join(st["chunks"][str(i)] for i in range(1, st["total"]+1))
-                    out_path = args.out
-                    with open(out_path, 'ab') as f:
-                        f.write(data_out)
-                    print(f'[server] MESSAGE COMPLETE session={session} msg_id={msg_id} total_bytes={len(data_out)}')
-                    del messages[key]
-                #log ACK tx
-                print(f'[server] TX ACK {ack_text}')
-                log_event(args.log, {
-                    "ts_ms": now_ms(),
-                    "direction": "server_tx",
-                    "dst": src,
-                    "wire_bytes": len(ack_bytes),
-                    "preview": ack_text,
-                    "data": ack_bytes.hex()
-                })
-            else:
-                print(f'[server] Malformed DATA')       
-        elif ptype == "A": #ACK
+        try:
+            pkt = dnsish.parse_packet(data)
+            parsed_ok = True
+        except dnsish.ParseError as e:
+            pkt = None
+            parse_err = str(e)
+            print(f"[server] RX (non-dnsish) from {src}: bytes={len(data)} err={parse_err}")
+            # still log raw and continue
+            ev = LogEvent(
+                ts_ms=now_ms(),
+                direction="server_rx",
+                src=src,
+                wire_bytes=len(data),
+                data_hex=data.hex(),
+                parse_ok=False
+            )
+            log_event(args.log, ev)
+            continue
+        #parse flags
+        flags = pkt.flags if pkt is not None else 0
+        is_ack = bool(flags & dnsish.FLAG_ACK)
+        is_data = bool(flags & dnsish.FLAG_DATA)
+        is_beacon = bool(flags & dnsish.FLAG_BEACON)
+        #initialize payload parsing results
+        payload_raw = None
+        payload_decode_ok = False
+        crc_calc = None
+        crc_ok = None
+        #attempt to decode payload if dnsish parsing succeeded
+        try:
+            payload_raw = dnsish.labels_to_payload(pkt.labels_raw, skip_prefix=PREFIX_LEN)
+            payload_ok = True
+            #check crc if payload decoded ok
+            crc_calc = dnsish.crc32_u32(payload_raw)
+            crc_ok = (crc_calc == pkt.crc32)
+        except Exception as e:
+            payload_raw = None
+            payload_ok = False
+            payload_err = str(e)            
+        #log results NO MATTER WHAT!
+        log_event(args.log, LogEvent(
+            ts_ms=now_ms(),
+            direction="server_rx",
+            wire_bytes=len(data),
+            data_hex=data.hex(),
+            src=src,
+            parse_ok=True,
+            payload_ok=payload_ok,
+            ver=pkt.ver,
+            flags=pkt.flags,
+            msg_id=pkt.msg_id,
+            seq=pkt.seq,
+            total=pkt.total,
+            crc_ok=crc_ok,
+        ))
+
+        #parse packet by flag
+        if is_beacon:
+            if (payload_raw is None) or (not crc_ok):
+                print(f"[server] BEACON drop msg_id={pkt.msg_id} crc_ok={crc_ok}")
+                continue
+            print(f"[server] BEACON msg_id={pkt.msg_id} payload_len={len(payload_raw)}")
+        elif is_data:
+            if (payload_raw is None) or (not crc_ok):
+                print(f"[server] DATA drop msg_id={pkt.msg_id} seq={pkt.seq}/{pkt.total} crc_ok={crc_ok}")
+                continue
+
+            key = (src, pkt.msg_id)  #consider adding session label
+            st = messages.get(key)
+            if st is None:
+                st = {"total": pkt.total, "chunks": {}}
+                messages[key] = st
+
+            # store chunk (dedupe)
+            if pkt.seq not in st["chunks"]:
+                st["chunks"][pkt.seq] = payload_raw
+
+            # send ACK (dnsish)
+            ack_bytes = dnsish.build_packet(
+                flags=dnsish.FLAG_ACK,
+                labels=PREFIX,
+                msg_id=pkt.msg_id,
+                seq=pkt.seq,
+                total=pkt.total,
+                payload=None,
+            )
+            sock.sendto(ack_bytes, addr)
+
+            log_event(args.log, LogEvent(
+                ts_ms=now_ms(),
+                direction="server_tx",
+                wire_bytes=len(ack_bytes),
+                data_hex=ack_bytes.hex(),
+                dst=src,
+                msg_id=pkt.msg_id,
+                seq=pkt.seq,
+                total=pkt.total,
+            ))
+            # reassemble if complete (simple logic assumes all chunks arrive, doesn't handle duplicates or out-of-order)
+            if len(st["chunks"]) == st["total"]:
+                data_out = b"".join(st["chunks"][i] for i in range(st["total"]))
+                with open(args.out, "ab") as f:
+                    f.write(data_out)
+                print(f"[server] MESSAGE COMPLETE src={src} msg_id={pkt.msg_id} bytes={len(data_out)}")
+                del messages[key]       
+        elif is_ack:
             print(f'[server] RX ACK (unexpected for server)')
         else:
-            print(f'[server] Unknown packet type: {ptype}')
-
-        event = {
-            "ts_ms": now_ms(),
-            "direction": "server_rx",
-            "src": src,
-            "wire_bytes": len(data),
-            "preview": preview,
-            "data": data.hex()
-        }
-        log_event(args.log, event)
+            print(f'[server] Unknown packet type: flags={flags}')
 
 if __name__ == "__main__":
     main()
