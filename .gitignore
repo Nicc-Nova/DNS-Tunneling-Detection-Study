@@ -1,3 +1,5 @@
 logs/*
-output
+output.bin
+test.txt
+
 !logs/.gitkeep
