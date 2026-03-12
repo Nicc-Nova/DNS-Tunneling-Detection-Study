@@ -1,9 +1,10 @@
+import os
 import  argparse
-from email.mime import text
 import socket
 import json
 import time
-import os
+import base64
+import zlib
 
 def now_ms() -> int:
     return int(time.time() * 1000)
@@ -22,12 +23,14 @@ def parse_args():
     parser.add_argument('--ip', default="127.0.0.1", help="IP address to bind (default: 127.0.0.1)")
     parser.add_argument('--port', type=int, default=53000, help="UDP Port to bind (default: 53000)")
     parser.add_argument('--log', default="logs/server.log", help="Path to JSONL log file (default: logs/server.log)")
+    parser.add_argument('--out', default="output", help="Directory to write complete messages (default: output)")
     return parser.parse_args()
 
 def main():
     args = parse_args()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((args.ip, args.port))
+    messages = {}
 
     print(f"[server] listening on UDP {args.ip}:{args.port}")
     print(f"[server] Logging to {args.log}")
@@ -61,12 +64,48 @@ def main():
                 msg_id = parts[2]
                 seq = parts[3]
                 total = parts[4]
+                crc_hex = parts[5]
+                payload_b32 = parts[6]
                 print(f'[server] DATA session={session} msg_id={msg_id} seq={seq}/{total}')
+                #decode payload
+                try:
+                    payload_raw = base64.b32decode(payload_b32, casefold=True)
+                except Exception as e:
+                    print(f"[server] base32 decode failed: {e}")
+                    payload_raw = None
+                #check crc
+                crc_calc = zlib.crc32(payload_raw) & 0xffffffff if payload_raw is not None else None
+                crc_calc_hex = f"{crc_calc:08x}" if crc_calc is not None else None
+                crc_ok = (crc_calc_hex == crc_hex)
+                if not crc_ok:
+                    print(f"[server] CRC mismatch: expected {crc_hex} calculated {crc_calc_hex}")
+                    #TODO: log rx with crc_ok = false
+                    continue
+                #store chunk
+                key = (session, msg_id)
+                st = messages.get(key)
+                if st is None:
+                    st = {"total": int(total), "chunks": {}}
+                    messages[key] = st
+                    #total should match, if not prefer first seen
+                if seq not in st["chunks"]:
+                    st["chunks"][seq] = payload_raw
+                else:
+                    #duplicate chunk, ignore
+                    pass
                 #Build ACK
                 ack_text = f"A|{session}|{msg_id}|{seq}"
                 ack_bytes = ack_text.encode("utf-8")
                 sock.sendto(ack_bytes, addr)
-
+                # reassemble message if complete
+                if len(st["chunks"]) == st["total"]:
+                    data_out = b''.join(st["chunks"][str(i)] for i in range(1, st["total"]+1))
+                    out_path = args.out
+                    with open(out_path, 'ab') as f:
+                        f.write(data_out)
+                    print(f'[server] MESSAGE COMPLETE session={session} msg_id={msg_id} total_bytes={len(data_out)}')
+                    del messages[key]
+                #log ACK tx
                 print(f'[server] TX ACK {ack_text}')
                 log_event(args.log, {
                     "ts_ms": now_ms(),
